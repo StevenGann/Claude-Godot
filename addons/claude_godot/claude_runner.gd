@@ -27,7 +27,8 @@ func send(
 	context_prompt: String,
 	session_id: String,
 	project_dir: String,
-	allow_file_access: bool
+	allow_file_access: bool,
+	model: String = ""
 ) -> void:
 	if _is_running:
 		push_warning("ClaudeRunner: request already in progress, ignoring.")
@@ -38,10 +39,11 @@ func send(
 
 	_join_thread()
 
-	var exe_info := _get_claude_exe_info()
+	# Bug fix 1.5: call the static directly; the non-static wrapper was redundant.
+	var exe_info := _get_claude_exe_info_static()
 	var args := _build_send_args(
 		exe_info.prefix, user_message, context_prompt,
-		session_id, project_dir, allow_file_access
+		session_id, project_dir, allow_file_access, model
 	)
 
 	_thread = Thread.new()
@@ -119,10 +121,6 @@ static func _get_claude_exe_info_static() -> Dictionary:
 		return {"exe": "claude", "prefix": []}
 
 
-func _get_claude_exe_info() -> Dictionary:
-	return _get_claude_exe_info_static()
-
-
 # ---------------------------------------------------------------------------
 # Argument construction for send()
 # ---------------------------------------------------------------------------
@@ -133,10 +131,14 @@ func _build_send_args(
 	context: String,
 	session_id: String,
 	project_dir: String,
-	allow_files: bool
+	allow_files: bool,
+	model: String = ""
 ) -> Array:
 	var args: Array = prefix.duplicate()
 	args.append_array(["--print", "--output-format", "stream-json", "--verbose"])
+
+	if model != "":
+		args.append_array(["--model", model])
 
 	if context != "":
 		args.append_array(["--append-system-prompt", context])

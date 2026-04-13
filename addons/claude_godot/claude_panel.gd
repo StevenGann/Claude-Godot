@@ -3,6 +3,11 @@
 @tool
 extends Control
 
+# Explicit preloads ensure dependency scripts are compiled before this file,
+# resolving class_name references that may not yet be registered at load time.
+const ClaudeRunner = preload("res://addons/claude_godot/claude_runner.gd")
+const ContextBuilder = preload("res://addons/claude_godot/context_builder.gd")
+
 ## Set by plugin.gd before this control is added to the dock.
 var editor_plugin: EditorPlugin
 

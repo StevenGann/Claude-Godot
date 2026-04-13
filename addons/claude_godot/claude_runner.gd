@@ -184,7 +184,7 @@ func _run_install_blocking(use_sudo: bool) -> void:
 	else:
 		exit_code = OS.execute("bash", ["-c", cmd], output)
 
-	var out_text := output[0] if output.size() > 0 else ""
+	var out_text: String = output[0] if output.size() > 0 else ""
 
 	if exit_code == 0:
 		# Verify the install actually worked
@@ -227,7 +227,7 @@ func _on_send_done(exit_code: int, output: Array) -> void:
 		)
 		return
 
-	var raw := output[0] if output.size() > 0 else ""
+	var raw: String = output[0] if output.size() > 0 else ""
 	if raw.is_empty():
 		error_occurred.emit(
 			"Claude returned no output (exit code: %d).\n\n" % exit_code +

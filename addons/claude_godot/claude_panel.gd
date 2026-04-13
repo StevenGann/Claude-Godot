@@ -40,6 +40,9 @@ var _install_button: Button
 var _auth_button: Button
 var _sudo_check: CheckButton
 
+# Title bar extra buttons
+var _export_btn: Button
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -47,6 +50,10 @@ var _runner: ClaudeRunner
 var _session_id: String = ""
 var _install_check_thread: Thread = null
 const _SETTINGS_KEY := "claude_godot_plugin"
+
+# Chat history persistence (4.3)
+var _message_history: Array = []  # Array of {type: String, text: String}
+const _HISTORY_MAX := 100
 
 # Bug fix 1.2: Pre-compiled RegEx — allocated once in _ready(), not on every message.
 var _re_code_block: RegEx
@@ -81,6 +88,7 @@ func _ready() -> void:
 
 	_build_ui()
 	_load_session_state()
+	_load_history()
 	_check_claude_installed_async()
 
 
@@ -132,15 +140,21 @@ func _build_title_bar() -> void:
 
 	_new_chat_button = Button.new()
 	_new_chat_button.text = "New"
-	_new_chat_button.tooltip_text = "Start a new conversation (clears session)"
+	_new_chat_button.tooltip_text = "Start a new conversation (clears session and history)"
 	_new_chat_button.pressed.connect(_on_new_chat_pressed)
 	hbox.add_child(_new_chat_button)
 
 	var clear_btn := Button.new()
 	clear_btn.text = "Clear"
-	clear_btn.tooltip_text = "Clear the chat display (session continues)"
+	clear_btn.tooltip_text = "Clear the chat display (session and history persist)"
 	clear_btn.pressed.connect(_on_clear_pressed)
 	hbox.add_child(clear_btn)
+
+	_export_btn = Button.new()
+	_export_btn.text = "Export"
+	_export_btn.tooltip_text = "Export chat history as Markdown to res://"
+	_export_btn.pressed.connect(_export_chat_markdown)
+	hbox.add_child(_export_btn)
 
 
 func _build_context_section() -> void:
@@ -368,7 +382,7 @@ func _build_input_area() -> void:
 # ---------------------------------------------------------------------------
 
 func _show_install_ui(npm_available: bool) -> void:
-	_clear_chat()
+	_clear_chat_ui()
 
 	# Bug fix 1.7: a stale session from a previous install is invalid — clear it.
 	if _session_id != "":
@@ -688,6 +702,16 @@ func _add_system_message(text: String) -> void:
 
 
 func _add_chat_bubble(text: String, msg_type: String) -> void:
+	# Record to history (skip transient system messages)
+	if msg_type != "system":
+		_message_history.append({"type": msg_type, "text": text})
+		if _message_history.size() > _HISTORY_MAX:
+			_message_history.pop_front()
+		_save_history()
+	_render_bubble(text, msg_type)
+
+
+func _render_bubble(text: String, msg_type: String) -> void:
 	var container := PanelContainer.new()
 	container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
@@ -778,6 +802,8 @@ func _set_ui_busy(busy: bool) -> void:
 		_input_text.editable = not busy
 	if is_instance_valid(_new_chat_button):
 		_new_chat_button.disabled = busy
+	if is_instance_valid(_export_btn):
+		_export_btn.disabled = busy
 
 
 func _on_new_chat_pressed() -> void:
@@ -789,15 +815,24 @@ func _on_new_chat_pressed() -> void:
 
 
 func _on_clear_pressed() -> void:
-	_clear_chat()
+	# Clears the display but keeps history so it reloads after restart.
+	_clear_chat_ui()
 
 
-func _clear_chat() -> void:
+func _clear_chat_ui() -> void:
+	## Removes all chat bubble nodes. Does NOT touch _message_history.
 	if not is_instance_valid(_chat_vbox):
 		return
 	for child in _chat_vbox.get_children():
 		child.queue_free()
 	_install_overlay = null
+
+
+func _clear_chat() -> void:
+	## Clears both the UI and the persistent history (used by New Chat).
+	_clear_chat_ui()
+	_message_history.clear()
+	_save_history()
 
 
 func _update_context_display() -> void:
@@ -830,3 +865,112 @@ func _save_session_state() -> void:
 
 func _load_session_state() -> void:
 	_session_id = _get_setting("session_id", "")
+
+
+# ---------------------------------------------------------------------------
+# Chat history persistence (4.3)
+# ---------------------------------------------------------------------------
+
+func _get_history_path() -> String:
+	var proj := ProjectSettings.globalize_path("res://")
+	var hash := proj.md5_text().left(12)
+	var dir := OS.get_user_data_dir() + "/claude_godot"
+	DirAccess.make_dir_recursive_absolute(dir)
+	return dir + "/history_" + hash + ".json"
+
+
+func _save_history() -> void:
+	var f := FileAccess.open(_get_history_path(), FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_string(JSON.stringify(_message_history))
+
+
+func _load_history() -> void:
+	var path := _get_history_path()
+	if not FileAccess.file_exists(path):
+		return
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return
+	var parsed = JSON.parse_string(f.get_as_text())
+	if not parsed is Array:
+		return
+	_message_history = parsed
+	for entry in _message_history:
+		if entry is Dictionary and entry.has("type") and entry.has("text"):
+			_render_bubble(entry["text"], entry["type"])
+
+
+# ---------------------------------------------------------------------------
+# Export chat as Markdown (4.6)
+# ---------------------------------------------------------------------------
+
+func _export_chat_markdown() -> void:
+	if _message_history.is_empty():
+		_status_label.text = "Nothing to export"
+		get_tree().create_timer(2.0).timeout.connect(
+			func():
+				if is_instance_valid(self):
+					_status_label.text = "Ready",
+			CONNECT_ONE_SHOT
+		)
+		return
+
+	var dt := Time.get_datetime_dict_from_system()
+	var filename := "claude_chat_%04d-%02d-%02d_%02d-%02d.md" % [
+		dt["year"], dt["month"], dt["day"], dt["hour"], dt["minute"]
+	]
+	var full_path := ProjectSettings.globalize_path("res://") + filename
+
+	var lines: Array[String] = ["# Claude Chat — %04d-%02d-%02d %02d:%02d\n" % [
+		dt["year"], dt["month"], dt["day"], dt["hour"], dt["minute"]
+	]]
+	for entry in _message_history:
+		if not (entry is Dictionary and entry.has("type") and entry.has("text")):
+			continue
+		match entry["type"]:
+			"user":
+				lines.append("## You\n\n" + entry["text"] + "\n")
+			"claude":
+				lines.append("## Claude\n\n" + entry["text"] + "\n")
+			"error":
+				lines.append("## Error\n\n> " + entry["text"].replace("\n", "\n> ") + "\n")
+
+	var f := FileAccess.open(full_path, FileAccess.WRITE)
+	if f == null:
+		_status_label.text = "Export failed (can't write file)"
+		return
+	f.store_string("\n".join(lines))
+	f.close()
+
+	_status_label.text = "Exported: res://" + filename
+	get_tree().create_timer(3.0).timeout.connect(
+		func():
+			if is_instance_valid(self):
+				_status_label.text = "Ready",
+		CONNECT_ONE_SHOT
+	)
+
+
+# ---------------------------------------------------------------------------
+# Scene tree right-click integration (4.5)
+# ---------------------------------------------------------------------------
+
+## Called by ClaudeContextMenu when "Ask Claude about this" is selected.
+## Pre-fills the input field with a prompt based on the current selection.
+func prefill_ask_about_selection() -> void:
+	if not is_instance_valid(_input_text) or not is_instance_valid(editor_plugin):
+		return
+	var nodes := editor_plugin.get_editor_interface().get_selection().get_selected_nodes()
+	if nodes.is_empty():
+		_input_text.text = "Tell me about the current scene."
+	elif nodes.size() == 1:
+		_input_text.text = "Tell me about the %s node (%s)." % [
+			nodes[0].name, nodes[0].get_class()
+		]
+	else:
+		var names := ", ".join(nodes.map(func(n: Node) -> String: return n.name))
+		_input_text.text = "Tell me about these nodes: %s." % names
+	_input_text.grab_focus()
+	show()

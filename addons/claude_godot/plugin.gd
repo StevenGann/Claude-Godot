@@ -2,8 +2,10 @@
 extends EditorPlugin
 
 const ClaudePanel = preload("res://addons/claude_godot/claude_panel.gd")
+const ClaudeContextMenu = preload("res://addons/claude_godot/claude_context_menu.gd")
 
 var _panel: Control
+var _context_menu: EditorContextMenuPlugin
 
 
 func _enter_tree() -> void:
@@ -15,8 +17,16 @@ func _enter_tree() -> void:
 		_panel._on_selection_changed
 	)
 
+	_context_menu = ClaudeContextMenu.new()
+	_context_menu.panel = _panel
+	add_context_menu_plugin(EditorContextMenuPlugin.CONTEXT_SLOT_SCENE_TREE, _context_menu)
+
 
 func _exit_tree() -> void:
+	if is_instance_valid(_context_menu):
+		remove_context_menu_plugin(_context_menu)
+		_context_menu = null
+
 	if not is_instance_valid(_panel):
 		return
 

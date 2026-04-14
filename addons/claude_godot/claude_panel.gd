@@ -25,13 +25,6 @@ var _context_info_label: RichTextLabel
 var _context_body: VBoxContainer
 var _include_context_toggle: CheckButton
 var _file_access_toggle: CheckButton
-var _settings_body: VBoxContainer
-var _model_option: OptionButton
-var _custom_prompt_edit: TextEdit
-var _scene_depth_spin: SpinBox
-var _log_lines_spin: SpinBox
-## Maps context section setting key -> CheckBox node, iterated in _build_settings_dict().
-var _ctx_toggles: Dictionary = {}
 
 # Install overlay nodes
 var _install_overlay: PanelContainer
@@ -137,8 +130,6 @@ func _build_ui() -> void:
 	_root_vbox.add_child(HSeparator.new())
 	_build_context_section()
 	_root_vbox.add_child(HSeparator.new())
-	_build_settings_section()
-	_root_vbox.add_child(HSeparator.new())
 	_build_chat_area()
 	_root_vbox.add_child(HSeparator.new())
 	_build_status_bar()
@@ -173,10 +164,16 @@ func _build_title_bar() -> void:
 	_export_btn.pressed.connect(_export_chat_markdown)
 	hbox.add_child(_export_btn)
 
+	var gear_btn := Button.new()
+	gear_btn.text = "\u2699"  # ⚙
+	gear_btn.tooltip_text = "Settings"
+	gear_btn.pressed.connect(_open_settings_dialog)
+	hbox.add_child(gear_btn)
+
 
 func _build_context_section() -> void:
 	var toggle_btn := Button.new()
-	toggle_btn.text = "Context ▼"
+	toggle_btn.text = "Context ▶"
 	toggle_btn.flat = true
 	toggle_btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
 	toggle_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -184,6 +181,7 @@ func _build_context_section() -> void:
 
 	_context_body = VBoxContainer.new()
 	_context_body.add_theme_constant_override("separation", 3)
+	_context_body.visible = false
 	_root_vbox.add_child(_context_body)
 
 	toggle_btn.pressed.connect(func():
@@ -228,77 +226,69 @@ func _build_context_section() -> void:
 	_update_context_display()
 
 
-func _build_settings_section() -> void:
-	var toggle_btn := Button.new()
-	toggle_btn.text = "Settings ▶"
-	toggle_btn.flat = true
-	toggle_btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
-	toggle_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_root_vbox.add_child(toggle_btn)
+func _open_settings_dialog() -> void:
+	var dialog := AcceptDialog.new()
+	dialog.title = "Claude Settings"
+	dialog.get_ok_button().text = "Close"
+	dialog.min_size = Vector2i(380, 0)
 
-	_settings_body = VBoxContainer.new()
-	_settings_body.visible = false  # Collapsed by default
-	_settings_body.add_theme_constant_override("separation", 5)
-	_root_vbox.add_child(_settings_body)
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.custom_minimum_size = Vector2(0, 440)
+	dialog.get_dialog_vbox().add_child(scroll)
 
-	toggle_btn.pressed.connect(func():
-		_settings_body.visible = not _settings_body.visible
-		toggle_btn.text = "Settings ▼" if _settings_body.visible else "Settings ▶"
-	)
+	var c := VBoxContainer.new()
+	c.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	c.add_theme_constant_override("separation", 8)
+	scroll.add_child(c)
 
-	# ── Model selection ────────────────────────────────────────────────────
+	# ── Model ────────────────────────────────────────────────────────────────
 	var model_row := HBoxContainer.new()
-	_settings_body.add_child(model_row)
-
+	c.add_child(model_row)
 	var model_lbl := Label.new()
 	model_lbl.text = "Model:"
-	model_lbl.custom_minimum_size.x = 52
+	model_lbl.custom_minimum_size.x = 60
 	model_row.add_child(model_lbl)
-
-	_model_option = OptionButton.new()
-	_model_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var model_opt := OptionButton.new()
+	model_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var saved_model: String = _get_setting("model", "claude-sonnet-4-6")
 	for i in _MODELS.size():
-		_model_option.add_item(_MODELS[i][0], i)
-		_model_option.set_item_metadata(i, _MODELS[i][1])
+		model_opt.add_item(_MODELS[i][0], i)
+		model_opt.set_item_metadata(i, _MODELS[i][1])
 		if _MODELS[i][1] == saved_model:
-			_model_option.select(i)
-	_model_option.item_selected.connect(func(idx: int):
-		_save_setting("model", _model_option.get_item_metadata(idx))
+			model_opt.select(i)
+	model_opt.item_selected.connect(func(idx: int):
+		_save_setting("model", model_opt.get_item_metadata(idx))
 	)
-	model_row.add_child(_model_option)
+	model_row.add_child(model_opt)
 
-	# ── Custom system prompt ───────────────────────────────────────────────
+	# ── Custom system prompt ──────────────────────────────────────────────────
 	var prompt_lbl := Label.new()
 	prompt_lbl.text = "Custom prompt (prepended to all messages):"
 	prompt_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_settings_body.add_child(prompt_lbl)
-
-	_custom_prompt_edit = TextEdit.new()
-	_custom_prompt_edit.placeholder_text = (
+	c.add_child(prompt_lbl)
+	var prompt_edit := TextEdit.new()
+	prompt_edit.placeholder_text = (
 		"e.g. \"My player uses a state machine in player_sm.gd.\n" +
 		"Always use my EventBus autoload for signals.\""
 	)
-	_custom_prompt_edit.custom_minimum_size = Vector2(0, 60)
-	_custom_prompt_edit.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
-	_custom_prompt_edit.text = _get_setting("custom_prompt", "")
-	# Save on focus-lost to avoid writing EditorSettings on every keystroke.
-	_custom_prompt_edit.focus_exited.connect(func():
-		_save_setting("custom_prompt", _custom_prompt_edit.text)
+	prompt_edit.custom_minimum_size = Vector2(0, 72)
+	prompt_edit.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	prompt_edit.text = _get_setting("custom_prompt", "")
+	prompt_edit.focus_exited.connect(func():
+		_save_setting("custom_prompt", prompt_edit.text)
 	)
-	_settings_body.add_child(_custom_prompt_edit)
+	c.add_child(prompt_edit)
 
-	_settings_body.add_child(HSeparator.new())
+	c.add_child(HSeparator.new())
 
-	# ── Context section checkboxes ─────────────────────────────────────────
+	# ── Context sections ──────────────────────────────────────────────────────
 	var ctx_lbl := Label.new()
 	ctx_lbl.text = "Context sections:"
-	_settings_body.add_child(ctx_lbl)
-
+	c.add_child(ctx_lbl)
 	var grid := GridContainer.new()
 	grid.columns = 2
-	_settings_body.add_child(grid)
-
+	c.add_child(grid)
 	_make_ctx_toggle(grid, "include_scene",         "Scene tree",    true)
 	_make_ctx_toggle(grid, "include_selection",     "Selected node", true)
 	_make_ctx_toggle(grid, "include_open_scripts",  "Open scripts",  true)
@@ -310,43 +300,49 @@ func _build_settings_section() -> void:
 	_make_ctx_toggle(grid, "include_script_source", "Script source", false)
 	_make_ctx_toggle(grid, "include_open_scenes",   "Open scenes",   false)
 
-	# Errors toggle + line count spinbox on the same row
+	# Errors toggle + line count
 	var errors_row := HBoxContainer.new()
-	_settings_body.add_child(errors_row)
+	c.add_child(errors_row)
 	_make_ctx_toggle(errors_row, "include_logs", "Errors  Lines:", false)
-	_log_lines_spin = SpinBox.new()
-	_log_lines_spin.min_value = 5
-	_log_lines_spin.max_value = 100
-	_log_lines_spin.step = 5
-	_log_lines_spin.value = _get_setting("log_line_count", 20)
-	_log_lines_spin.custom_minimum_size.x = 68
-	_log_lines_spin.value_changed.connect(func(v: float): _save_setting("log_line_count", int(v)))
-	errors_row.add_child(_log_lines_spin)
+	var log_spin := SpinBox.new()
+	log_spin.min_value = 5
+	log_spin.max_value = 100
+	log_spin.step = 5
+	log_spin.value = _get_setting("log_line_count", 20)
+	log_spin.custom_minimum_size.x = 68
+	log_spin.value_changed.connect(func(v: float): _save_setting("log_line_count", int(v)))
+	errors_row.add_child(log_spin)
 
-	# Scene tree depth spinbox
+	# Scene tree depth
 	var depth_row := HBoxContainer.new()
-	_settings_body.add_child(depth_row)
+	c.add_child(depth_row)
 	var depth_lbl := Label.new()
 	depth_lbl.text = "Scene tree depth:"
 	depth_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	depth_row.add_child(depth_lbl)
-	_scene_depth_spin = SpinBox.new()
-	_scene_depth_spin.min_value = 1
-	_scene_depth_spin.max_value = 5
-	_scene_depth_spin.value = _get_setting("scene_depth", 1)
-	_scene_depth_spin.custom_minimum_size.x = 68
-	_scene_depth_spin.value_changed.connect(func(v: float): _save_setting("scene_depth", int(v)))
-	depth_row.add_child(_scene_depth_spin)
+	var depth_spin := SpinBox.new()
+	depth_spin.min_value = 1
+	depth_spin.max_value = 5
+	depth_spin.value = _get_setting("scene_depth", 1)
+	depth_spin.custom_minimum_size.x = 68
+	depth_spin.value_changed.connect(func(v: float): _save_setting("scene_depth", int(v)))
+	depth_row.add_child(depth_spin)
+
+	add_child(dialog)
+	dialog.popup_centered()
+	var _on_close := func():
+		_save_setting("custom_prompt", prompt_edit.text)
+		dialog.queue_free()
+	dialog.confirmed.connect(_on_close, CONNECT_ONE_SHOT)
+	dialog.close_requested.connect(_on_close, CONNECT_ONE_SHOT)
 
 
-## Creates a CheckBox, registers it in _ctx_toggles, and adds it to parent.
 func _make_ctx_toggle(parent: Control, key: String, label: String, default_val: bool) -> CheckBox:
 	var cb := CheckBox.new()
 	cb.text = label
 	cb.button_pressed = _get_setting(key, default_val)
 	cb.toggled.connect(func(on: bool): _save_setting(key, on))
 	parent.add_child(cb)
-	_ctx_toggles[key] = cb
 	return cb
 
 
@@ -631,20 +627,28 @@ func _send_message() -> void:
 
 
 ## Assembles the settings dictionary passed to ContextBuilder.build().
+## Reads directly from EditorSettings so dialog widgets need not persist.
 func _build_settings_dict() -> Dictionary:
-	var d: Dictionary = {}
-	for key in _ctx_toggles:
-		d[key] = (_ctx_toggles[key] as CheckBox).button_pressed
-	d["custom_prompt"] = _custom_prompt_edit.text.strip_edges() if is_instance_valid(_custom_prompt_edit) else ""
-	d["scene_depth"] = int(_scene_depth_spin.value) if is_instance_valid(_scene_depth_spin) else 1
-	d["log_line_count"] = int(_log_lines_spin.value) if is_instance_valid(_log_lines_spin) else 20
-	return d
+	return {
+		"custom_prompt":        _get_setting("custom_prompt", ""),
+		"scene_depth":          _get_setting("scene_depth", 1),
+		"log_line_count":       _get_setting("log_line_count", 20),
+		"include_scene":        _get_setting("include_scene", true),
+		"include_selection":    _get_setting("include_selection", true),
+		"include_open_scripts": _get_setting("include_open_scripts", true),
+		"include_exports":      _get_setting("include_exports", true),
+		"include_autoloads":    _get_setting("include_autoloads", true),
+		"include_input_map":    _get_setting("include_input_map", false),
+		"include_animations":   _get_setting("include_animations", true),
+		"include_signals":      _get_setting("include_signals", false),
+		"include_script_source":_get_setting("include_script_source", false),
+		"include_open_scenes":  _get_setting("include_open_scenes", false),
+		"include_logs":         _get_setting("include_logs", false),
+	}
 
 
 func _get_selected_model() -> String:
-	if not is_instance_valid(_model_option):
-		return ""
-	return _model_option.get_item_metadata(_model_option.selected)
+	return _get_setting("model", "claude-sonnet-4-6")
 
 
 # ---------------------------------------------------------------------------
@@ -940,15 +944,16 @@ func _markdown_to_bbcode(text: String) -> String:
 	## Code blocks are handled with a state flag so their content is never
 	## transformed by inline rules, and [ characters are escaped before any
 	## BBCode tags are inserted to prevent injection from Claude's output.
+	## Table rows (| ... |) are accumulated and rendered via _render_table().
 	var lines := text.split("\n")
 	var out: Array[String] = []
 	var in_code_block := false
 	var code_lines: Array[String] = []
+	var table_rows: Array[String] = []
 
 	for raw_line: String in lines:
 		if in_code_block:
 			if raw_line.begins_with("```"):
-				# Close the block — escape content, then wrap
 				var inner := _escape_bbcode("\n".join(code_lines))
 				out.append("[bgcolor=#1a1a1a][color=#cccccc][code]" + inner + "[/code][/color][/bgcolor]")
 				code_lines.clear()
@@ -956,9 +961,23 @@ func _markdown_to_bbcode(text: String) -> String:
 			else:
 				code_lines.append(raw_line)
 		elif raw_line.begins_with("```"):
+			# Flush any pending table before entering code block
+			if not table_rows.is_empty():
+				out.append(_render_table(table_rows))
+				table_rows.clear()
 			in_code_block = true
+		elif raw_line.strip_edges().begins_with("|"):
+			table_rows.append(raw_line)
 		else:
+			# Flush any pending table before non-table line
+			if not table_rows.is_empty():
+				out.append(_render_table(table_rows))
+				table_rows.clear()
 			out.append(_md_line(raw_line))
+
+	# Flush any pending table at end of text
+	if not table_rows.is_empty():
+		out.append(_render_table(table_rows))
 
 	# Unclosed code block — flush without closing tag
 	if in_code_block and not code_lines.is_empty():
@@ -966,6 +985,71 @@ func _markdown_to_bbcode(text: String) -> String:
 		out.append("[color=#cccccc][code]" + inner + "[/code][/color]")
 
 	return "\n".join(out)
+
+
+func _split_table_row(row: String) -> Array[String]:
+	## Splits "| a | b | c |" into ["a", "b", "c"], trimming whitespace.
+	var stripped: String = row.strip_edges()
+	if stripped.begins_with("|"):
+		stripped = stripped.substr(1)
+	if stripped.ends_with("|"):
+		stripped = stripped.substr(0, stripped.length() - 1)
+	var cells: Array[String] = []
+	for cell: String in stripped.split("|"):
+		cells.append(cell.strip_edges())
+	return cells
+
+
+func _is_separator_row(cells: Array[String]) -> bool:
+	## Returns true if all cells contain only dashes, colons, and spaces (e.g. |---|:--:|).
+	for cell: String in cells:
+		var c: String = cell.strip_edges()
+		if c.is_empty():
+			continue
+		var clean: String = c.replace("-", "").replace(":", "").replace(" ", "")
+		if not clean.is_empty():
+			return false
+	return true
+
+
+func _render_table(rows: Array[String]) -> String:
+	## Converts accumulated | ... | rows into BBCode [table=N]...[/table].
+	if rows.is_empty():
+		return ""
+
+	# Parse all rows, skipping separator rows
+	var parsed: Array = []
+	for row: String in rows:
+		var cells: Array[String] = _split_table_row(row)
+		if not _is_separator_row(cells):
+			parsed.append(cells)
+
+	if parsed.is_empty():
+		return ""
+
+	# Determine column count from widest row
+	var col_count := 0
+	for row in parsed:
+		if (row as Array[String]).size() > col_count:
+			col_count = (row as Array[String]).size()
+
+	if col_count == 0:
+		return ""
+
+	var bbcode := "[table=%d]" % col_count
+	var is_header := true
+	for row in parsed:
+		var cells: Array[String] = row as Array[String]
+		for i in range(col_count):
+			var cell_text: String = cells[i] if i < cells.size() else ""
+			var rendered: String = _md_spans(cell_text)
+			if is_header:
+				bbcode += "[cell][b]" + rendered + "[/b][/cell]"
+			else:
+				bbcode += "[cell]" + rendered + "[/cell]"
+		is_header = false
+	bbcode += "[/table]"
+	return bbcode
 
 
 func _md_line(line: String) -> String:

@@ -14,6 +14,7 @@ signal stream_finished(session_id: String)
 
 var _thread: Thread = null
 var _is_running: bool = false
+var _aborted: bool = false
 
 # Streaming state
 var _stream_pid: int = -1
@@ -43,6 +44,7 @@ func send(
 		push_warning("ClaudeRunner: request already in progress, ignoring.")
 		return
 
+	_aborted = false
 	_is_running = true
 	request_started.emit()
 
@@ -91,6 +93,17 @@ func open_auth() -> void:
 			OS.create_process("bash", ["-c", "claude auth login"])
 
 
+## Cancels any in-flight request. For streaming, kills the process.
+## For the blocking thread path, marks the response to be discarded on arrival.
+func abort() -> void:
+	_aborted = true
+	if _stream_pid > 0:
+		if OS.is_process_running(_stream_pid):
+			OS.kill(_stream_pid)
+		_stream_pid = -1
+	_is_running = false
+
+
 ## Starts claude as a background process with stdout piped to a temp file.
 ## Returns true on success; false on Windows (caller should use send() instead).
 func start_stream(
@@ -106,6 +119,7 @@ func start_stream(
 	if OS.get_name() in ["Windows", "UWP"]:
 		return false  # streaming via bash not available on Windows
 
+	_aborted = false
 	_is_running = true
 	_stream_accumulated = ""
 	_stream_read_pos = 0
@@ -123,8 +137,12 @@ func start_stream(
 	var args := _build_send_args([], user_message, context_prompt,
 		session_id, project_dir, allow_file_access, model)
 
-	# Write a bash script so arg values are never interpolated by a shell
-	var cmd := "claude"
+	# Write a bash script so arg values are never interpolated by a shell.
+	# Export Godot's own PATH so the same 'claude' that check_installed() found
+	# is reachable in the non-login bash subprocess.
+	var env_path := OS.get_environment("PATH")
+	var cmd := "export PATH=" + _bash_single_quote(env_path) + "\n"
+	cmd += "claude"
 	for a: String in args:
 		cmd += " " + _bash_single_quote(a)
 	cmd += " > " + _bash_single_quote(out_path)
@@ -386,6 +404,10 @@ func _emit_install_progress(message: String) -> void:
 
 func _on_send_done(exit_code: int, output: Array) -> void:
 	_is_running = false
+
+	if _aborted:
+		_aborted = false
+		return  # request was cancelled; discard response silently
 
 	if exit_code == -1:
 		error_occurred.emit(

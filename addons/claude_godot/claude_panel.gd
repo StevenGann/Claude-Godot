@@ -59,6 +59,7 @@ var _streaming_text: String = ""
 
 # Thinking indicator
 var _thinking_bubble: PanelContainer = null
+var _thinking_label: RichTextLabel = null
 var _thinking_timer: Timer = null
 var _thinking_frame: int = 0
 const _THINKING_FRAMES: Array = ["●  ○  ○", "○  ●  ○", "○  ○  ●", "○  ●  ○"]
@@ -717,16 +718,31 @@ func _show_thinking_bubble() -> void:
 	_thinking_bubble = PanelContainer.new()
 	_thinking_bubble.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
-	var label := RichTextLabel.new()
-	label.bbcode_enabled = true
-	label.fit_content = true
-	label.scroll_active = false
-	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	label.name = "ThinkingLabel"
-	label.text = "[color=#a8d5a2][b]Claude[/b][/color]\n[color=#666666]" + _THINKING_FRAMES[0] + "[/color]"
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 4)
+	_thinking_bubble.add_child(vbox)
 
-	_thinking_bubble.add_child(label)
+	_thinking_label = RichTextLabel.new()
+	_thinking_label.bbcode_enabled = true
+	_thinking_label.fit_content = true
+	_thinking_label.scroll_active = false
+	_thinking_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_thinking_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_thinking_label.text = (
+		"[color=#a8d5a2][b]Claude[/b][/color]\n[color=#666666]" + _THINKING_FRAMES[0] + "[/color]"
+	)
+	vbox.add_child(_thinking_label)
+
+	var cancel_row := HBoxContainer.new()
+	vbox.add_child(cancel_row)
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cancel_row.add_child(spacer)
+	var cancel_btn := Button.new()
+	cancel_btn.text = "Cancel"
+	cancel_btn.pressed.connect(_on_cancel_pressed)
+	cancel_row.add_child(cancel_btn)
+
 	_chat_vbox.add_child(_thinking_bubble)
 	call_deferred("_do_scroll_to_bottom")
 
@@ -739,12 +755,12 @@ func _show_thinking_bubble() -> void:
 
 
 func _on_thinking_tick() -> void:
-	if not is_instance_valid(_thinking_bubble):
+	if not is_instance_valid(_thinking_label):
 		return
 	_thinking_frame = (_thinking_frame + 1) % _THINKING_FRAMES.size()
-	var label := _thinking_bubble.get_node_or_null("ThinkingLabel") as RichTextLabel
-	if is_instance_valid(label):
-		label.text = "[color=#a8d5a2][b]Claude[/b][/color]\n[color=#666666]" + _THINKING_FRAMES[_thinking_frame] + "[/color]"
+	_thinking_label.text = (
+		"[color=#a8d5a2][b]Claude[/b][/color]\n[color=#666666]" + _THINKING_FRAMES[_thinking_frame] + "[/color]"
+	)
 
 
 func _hide_thinking_bubble() -> void:
@@ -755,6 +771,17 @@ func _hide_thinking_bubble() -> void:
 	if is_instance_valid(_thinking_bubble):
 		_thinking_bubble.queue_free()
 		_thinking_bubble = null
+	_thinking_label = null
+
+
+func _on_cancel_pressed() -> void:
+	_stop_poll_timer()
+	_runner.abort()
+	_hide_thinking_bubble()
+	_discard_streaming_bubble()
+	_set_ui_busy(false)
+	_status_label.text = "Ready"
+	_add_system_message("Request cancelled.")
 
 
 # ---------------------------------------------------------------------------

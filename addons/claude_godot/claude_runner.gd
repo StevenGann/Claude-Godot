@@ -205,7 +205,22 @@ func _parse_ndjson_line(line: String) -> void:
 	if not parsed is Dictionary:
 		return
 	match parsed.get("type", ""):
+		"assistant":
+			# The Claude Code CLI emits progressive "assistant" events whose
+			# message.content[0].text grows with each chunk — emit only the delta.
+			var msg = parsed.get("message", {})
+			if msg is Dictionary:
+				var content = msg.get("content", [])
+				if content is Array and content.size() > 0:
+					var block = content[0]
+					if block is Dictionary and block.get("type") == "text":
+						var full_text: String = block.get("text", "")
+						if full_text.length() > _stream_accumulated.length():
+							var new_chunk := full_text.substr(_stream_accumulated.length())
+							_stream_accumulated = full_text
+							stream_chunk.emit(new_chunk)
 		"content_block_delta":
+			# Anthropic API delta format — kept as fallback
 			var delta = parsed.get("delta", {})
 			if delta is Dictionary and delta.get("type") == "text_delta":
 				var chunk: String = delta.get("text", "")
@@ -217,7 +232,7 @@ func _parse_ndjson_line(line: String) -> void:
 				_is_running = false
 				error_occurred.emit(parsed.get("result", "Unknown error from Claude."))
 			else:
-				# Fallback: if no delta events arrived, use the final result text
+				# If no streaming events produced text, use the final result field
 				if _stream_accumulated.is_empty():
 					var result_text: String = parsed.get("result", "")
 					if not result_text.is_empty():

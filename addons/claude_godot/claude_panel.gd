@@ -718,9 +718,9 @@ func _show_thinking_bubble() -> void:
 	_thinking_bubble = PanelContainer.new()
 	_thinking_bubble.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
-	var vbox := VBoxContainer.new()
-	vbox.add_theme_constant_override("separation", 4)
-	_thinking_bubble.add_child(vbox)
+	var hbox := HBoxContainer.new()
+	hbox.add_theme_constant_override("separation", 6)
+	_thinking_bubble.add_child(hbox)
 
 	_thinking_label = RichTextLabel.new()
 	_thinking_label.bbcode_enabled = true
@@ -731,17 +731,13 @@ func _show_thinking_bubble() -> void:
 	_thinking_label.text = (
 		"[color=#a8d5a2][b]Claude[/b][/color]\n[color=#666666]" + _THINKING_FRAMES[0] + "[/color]"
 	)
-	vbox.add_child(_thinking_label)
+	hbox.add_child(_thinking_label)
 
-	var cancel_row := HBoxContainer.new()
-	vbox.add_child(cancel_row)
-	var spacer := Control.new()
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	cancel_row.add_child(spacer)
 	var cancel_btn := Button.new()
 	cancel_btn.text = "Cancel"
+	cancel_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	cancel_btn.pressed.connect(_on_cancel_pressed)
-	cancel_row.add_child(cancel_btn)
+	hbox.add_child(cancel_btn)
 
 	_chat_vbox.add_child(_thinking_bubble)
 	call_deferred("_do_scroll_to_bottom")
@@ -926,8 +922,7 @@ func _do_scroll_to_bottom() -> void:
 # ---------------------------------------------------------------------------
 
 func _compile_regexes() -> void:
-	_re_code_block = RegEx.new()
-	_re_code_block.compile("```(?:[a-zA-Z0-9]*)?\n([\\s\\S]*?)```")
+	# _re_code_block no longer used — code blocks handled line-by-line
 	_re_inline_code = RegEx.new()
 	_re_inline_code.compile("`([^`\n]+)`")
 	_re_bold = RegEx.new()
@@ -941,29 +936,64 @@ func _escape_bbcode(text: String) -> String:
 
 
 func _markdown_to_bbcode(text: String) -> String:
-	var result := text
-	result = _re_code_block.sub(result, "[code]$1[/code]", true)
-	result = _re_inline_code.sub(result, "[code]$1[/code]", true)
-	result = _re_bold.sub(result, "[b]$1[/b]", true)
-	result = _re_italic.sub(result, "[i]$1[/i]", true)
-
-	var lines := result.split("\n")
+	## Converts Markdown to Godot BBCode, line by line.
+	## Code blocks are handled with a state flag so their content is never
+	## transformed by inline rules, and [ characters are escaped before any
+	## BBCode tags are inserted to prevent injection from Claude's output.
+	var lines := text.split("\n")
 	var out: Array[String] = []
-	for line in lines:
-		if line.begins_with("### "):
-			out.append("[b]" + line.substr(4) + "[/b]")
-		elif line.begins_with("## "):
-			out.append("[b]" + line.substr(3) + "[/b]")
-		elif line.begins_with("# "):
-			out.append("[b]" + line.substr(2) + "[/b]")
-		elif line.begins_with("- ") or line.begins_with("* "):
-			out.append("  \u2022 " + line.substr(2))
-		elif line.begins_with("    - ") or line.begins_with("    * "):
-			out.append("    \u25e6 " + line.substr(6))
+	var in_code_block := false
+	var code_lines: Array[String] = []
+
+	for raw_line: String in lines:
+		if in_code_block:
+			if raw_line.begins_with("```"):
+				# Close the block — escape content, then wrap
+				var inner := _escape_bbcode("\n".join(code_lines))
+				out.append("[bgcolor=#1a1a1a][color=#cccccc][code]" + inner + "[/code][/color][/bgcolor]")
+				code_lines.clear()
+				in_code_block = false
+			else:
+				code_lines.append(raw_line)
+		elif raw_line.begins_with("```"):
+			in_code_block = true
 		else:
-			out.append(line)
+			out.append(_md_line(raw_line))
+
+	# Unclosed code block — flush without closing tag
+	if in_code_block and not code_lines.is_empty():
+		var inner := _escape_bbcode("\n".join(code_lines))
+		out.append("[color=#cccccc][code]" + inner + "[/code][/color]")
 
 	return "\n".join(out)
+
+
+func _md_line(line: String) -> String:
+	## Applies block-level Markdown rules to one line, then inline spans.
+	if line.begins_with("### "):
+		return "[b]" + _md_spans(line.substr(4)) + "[/b]"
+	elif line.begins_with("## "):
+		return "[font_size=15][b]" + _md_spans(line.substr(3)) + "[/b][/font_size]"
+	elif line.begins_with("# "):
+		return "[font_size=17][b]" + _md_spans(line.substr(2)) + "[/b][/font_size]"
+	elif line.begins_with("- ") or line.begins_with("* "):
+		return "  \u2022 " + _md_spans(line.substr(2))
+	elif line.begins_with("    - ") or line.begins_with("    * "):
+		return "    \u25e6 " + _md_spans(line.substr(6))
+	elif line == "---" or line == "___":
+		return "[color=#444444]\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500[/color]"
+	else:
+		return _md_spans(line)
+
+
+func _md_spans(text: String) -> String:
+	## Escapes [ first so Claude's brackets can't become BBCode, then applies
+	## inline rules (bold, italic, inline-code) using pre-compiled regexes.
+	var s := _escape_bbcode(text)
+	s = _re_inline_code.sub(s, "[color=#e8c97a][code]$1[/code][/color]", true)
+	s = _re_bold.sub(s, "[b]$1[/b]", true)
+	s = _re_italic.sub(s, "[i]$1[/i]", true)
+	return s
 
 
 # ---------------------------------------------------------------------------

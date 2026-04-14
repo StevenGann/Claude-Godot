@@ -235,7 +235,7 @@ func _open_settings_dialog() -> void:
 	var scroll := ScrollContainer.new()
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	scroll.custom_minimum_size = Vector2(0, 440)
-	dialog.get_dialog_vbox().add_child(scroll)
+	dialog.add_child(scroll)
 
 	var c := VBoxContainer.new()
 	c.size_flags_horizontal = Control.SIZE_EXPAND_FILL

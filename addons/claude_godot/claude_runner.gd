@@ -9,9 +9,18 @@ signal error_occurred(message: String)
 signal request_started()
 signal install_progress(message: String)
 signal install_finished(success: bool, message: String)
+signal stream_chunk(text: String)
+signal stream_finished(session_id: String)
 
 var _thread: Thread = null
 var _is_running: bool = false
+
+# Streaming state
+var _stream_pid: int = -1
+var _stream_out_path: String = ""
+var _stream_read_pos: int = 0
+var _stream_partial: String = ""
+var _stream_accumulated: String = ""
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +91,167 @@ func open_auth() -> void:
 			OS.create_process("bash", ["-c", "claude auth login"])
 
 
+## Starts claude as a background process with stdout piped to a temp file.
+## Returns true on success; false on Windows (caller should use send() instead).
+func start_stream(
+	user_message: String,
+	context_prompt: String,
+	session_id: String,
+	project_dir: String,
+	allow_file_access: bool,
+	model: String = ""
+) -> bool:
+	if _is_running:
+		return false
+	if OS.get_name() in ["Windows", "UWP"]:
+		return false  # streaming via bash not available on Windows
+
+	_is_running = true
+	_stream_accumulated = ""
+	_stream_read_pos = 0
+	_stream_partial = ""
+	request_started.emit()
+
+	var out_path := OS.get_user_data_dir() + "/claude_godot_stream.tmp"
+	var script_path := OS.get_user_data_dir() + "/claude_godot_run.sh"
+	_stream_out_path = out_path
+
+	if FileAccess.file_exists(out_path):
+		DirAccess.remove_absolute(out_path)
+
+	# Build the claude args (no platform prefix — bash will find claude on PATH)
+	var args := _build_send_args([], user_message, context_prompt,
+		session_id, project_dir, allow_file_access, model)
+
+	# Write a bash script so arg values are never interpolated by a shell
+	var cmd := "claude"
+	for a: String in args:
+		cmd += " " + _bash_single_quote(a)
+	cmd += " > " + _bash_single_quote(out_path)
+
+	var sf := FileAccess.open(script_path, FileAccess.WRITE)
+	if sf == null:
+		_is_running = false
+		return false
+	sf.store_string("#!/bin/bash\n" + cmd + "\n")
+	sf.close()
+
+	_stream_pid = OS.create_process("bash", [script_path])
+	if _stream_pid <= 0:
+		_is_running = false
+		return false
+
+	return true
+
+
+## Called by a Timer in ClaudePanel every ~100 ms to read new output.
+func poll_stream() -> void:
+	if not _is_running:
+		return
+
+	if FileAccess.file_exists(_stream_out_path):
+		var f := FileAccess.open(_stream_out_path, FileAccess.READ)
+		if f != null:
+			var file_len := f.get_length()
+			if file_len > _stream_read_pos:
+				f.seek(_stream_read_pos)
+				var new_bytes := f.get_buffer(file_len - _stream_read_pos)
+				_stream_read_pos = file_len
+				f.close()
+				_ingest_stream_bytes(new_bytes.get_string_from_utf8())
+			else:
+				f.close()
+
+	if _stream_pid > 0 and not OS.is_process_running(_stream_pid):
+		_stream_pid = -1
+		_do_final_stream_read()
+
+
+func _ingest_stream_bytes(new_content: String) -> void:
+	var to_parse := _stream_partial + new_content
+	var lines := to_parse.split("\n")
+	# If content doesn't end with \n, the last element is an incomplete line
+	if to_parse.ends_with("\n"):
+		_stream_partial = ""
+	else:
+		_stream_partial = lines[-1]
+		lines.resize(lines.size() - 1)
+	for line: String in lines:
+		var trimmed := line.strip_edges()
+		if not trimmed.is_empty():
+			_parse_ndjson_line(trimmed)
+
+
+func _parse_ndjson_line(line: String) -> void:
+	var parsed = JSON.parse_string(line)
+	if not parsed is Dictionary:
+		return
+	match parsed.get("type", ""):
+		"content_block_delta":
+			var delta = parsed.get("delta", {})
+			if delta is Dictionary and delta.get("type") == "text_delta":
+				var chunk: String = delta.get("text", "")
+				if not chunk.is_empty():
+					_stream_accumulated += chunk
+					stream_chunk.emit(chunk)
+		"result":
+			if parsed.get("is_error", false):
+				_is_running = false
+				error_occurred.emit(parsed.get("result", "Unknown error from Claude."))
+			else:
+				# Fallback: if no delta events arrived, use the final result text
+				if _stream_accumulated.is_empty():
+					var result_text: String = parsed.get("result", "")
+					if not result_text.is_empty():
+						_stream_accumulated = result_text
+						stream_chunk.emit(result_text)
+				_is_running = false
+				stream_finished.emit(parsed.get("session_id", ""))
+
+
+func _do_final_stream_read() -> void:
+	# One last read to catch any bytes written after our previous poll
+	if FileAccess.file_exists(_stream_out_path):
+		var f := FileAccess.open(_stream_out_path, FileAccess.READ)
+		if f != null:
+			var file_len := f.get_length()
+			if file_len > _stream_read_pos:
+				f.seek(_stream_read_pos)
+				var new_bytes := f.get_buffer(file_len - _stream_read_pos)
+				_stream_read_pos = file_len
+				f.close()
+				_ingest_stream_bytes(new_bytes.get_string_from_utf8())
+			else:
+				f.close()
+
+	# Flush any partial line
+	if not _stream_partial.strip_edges().is_empty():
+		_parse_ndjson_line(_stream_partial.strip_edges())
+		_stream_partial = ""
+
+	# If no result event was ever received, synthesise an error
+	if _is_running:
+		_is_running = false
+		if _stream_accumulated.is_empty():
+			error_occurred.emit(
+				"Claude returned no output.\n\nMake sure you are authenticated:\n  claude auth login"
+			)
+		else:
+			stream_finished.emit("")
+
+
+static func _bash_single_quote(s: String) -> String:
+	## Wraps s in bash single quotes; internal single quotes are escaped as '\''
+	return "'" + s.replace("'", "'\\''") + "'"
+
+
 func cleanup() -> void:
 	## Must be called before queue_free() to safely join any running thread.
+	if _stream_pid > 0:
+		if OS.is_process_running(_stream_pid):
+			OS.kill(_stream_pid)
+		_stream_pid = -1
+	_is_running = false
 	_join_thread()
 
 

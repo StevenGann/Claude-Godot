@@ -51,6 +51,18 @@ var _session_id: String = ""
 var _install_check_thread: Thread = null
 const _SETTINGS_KEY := "claude_godot_plugin"
 
+# Streaming
+var _poll_timer: Timer = null
+var _streaming_container: PanelContainer = null
+var _streaming_label: RichTextLabel = null
+var _streaming_text: String = ""
+
+# Thinking indicator
+var _thinking_bubble: PanelContainer = null
+var _thinking_timer: Timer = null
+var _thinking_frame: int = 0
+const _THINKING_FRAMES: Array = ["●  ○  ○", "○  ●  ○", "○  ○  ●", "○  ●  ○"]
+
 # Chat history persistence (4.3)
 var _message_history: Array = []  # Array of {type: String, text: String}
 const _HISTORY_MAX := 100
@@ -85,6 +97,8 @@ func _ready() -> void:
 	_runner.request_started.connect(_on_request_started)
 	_runner.install_progress.connect(_on_install_progress)
 	_runner.install_finished.connect(_on_install_finished)
+	_runner.stream_chunk.connect(_on_stream_chunk)
+	_runner.stream_finished.connect(_on_stream_finished)
 
 	_build_ui()
 	_load_session_state()
@@ -94,6 +108,8 @@ func _ready() -> void:
 
 func cleanup() -> void:
 	## Called by plugin.gd before queue_free() to safely join threads.
+	_stop_poll_timer()
+	_hide_thinking_bubble()
 	if _runner:
 		_runner.cleanup()
 	if _install_check_thread != null and _install_check_thread.is_started():
@@ -359,7 +375,7 @@ func _build_input_area() -> void:
 	_root_vbox.add_child(hbox)
 
 	_input_text = TextEdit.new()
-	_input_text.placeholder_text = "Ask Claude... (Ctrl+Enter to send)"
+	_input_text.placeholder_text = "Ask Claude... (Enter to send, Shift+Enter for newline)"
 	_input_text.custom_minimum_size = Vector2(0, 72)
 	_input_text.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_input_text.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
@@ -527,12 +543,10 @@ func _on_auth_pressed() -> void:
 	_runner.open_auth()
 	# Bug fix 1.6: use CONNECT_ONE_SHOT and guard with is_instance_valid so the
 	# callback is safely skipped if the panel is freed before the timer fires.
-	get_tree().create_timer(3.0).timeout.connect(
-		func():
-			if is_instance_valid(self):
-				_check_claude_installed_async(),
-		CONNECT_ONE_SHOT
-	)
+	var _auth_check_cb := func():
+		if is_instance_valid(self):
+			_check_claude_installed_async()
+	get_tree().create_timer(3.0).timeout.connect(_auth_check_cb, CONNECT_ONE_SHOT)
 
 
 # ---------------------------------------------------------------------------
@@ -574,9 +588,13 @@ func _on_install_check_done(claude_installed: bool, npm_available: bool) -> void
 
 func _on_input_gui_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_ENTER and event.ctrl_pressed:
-			_send_message()
-			get_viewport().set_input_as_handled()
+		if event.keycode == KEY_ENTER:
+			if event.shift_pressed:
+				# Shift+Enter: insert a newline (let TextEdit handle it normally)
+				pass
+			else:
+				_send_message()
+				get_viewport().set_input_as_handled()
 
 
 func _on_send_pressed() -> void:
@@ -602,10 +620,13 @@ func _send_message() -> void:
 	if _file_access_toggle.button_pressed:
 		project_dir = ProjectSettings.globalize_path("res://")
 
-	_runner.send(
-		text, context, _session_id, project_dir,
-		_file_access_toggle.button_pressed, _get_selected_model()
-	)
+	var model := _get_selected_model()
+	var allow_files := _file_access_toggle.button_pressed
+	# Try streaming (Linux / macOS). Falls back to blocking send on Windows.
+	if _runner.start_stream(text, context, _session_id, project_dir, allow_files, model):
+		_start_poll_timer()
+	else:
+		_runner.send(text, context, _session_id, project_dir, allow_files, model)
 
 
 ## Assembles the settings dictionary passed to ContextBuilder.build().
@@ -664,9 +685,11 @@ func _on_preview_context_pressed() -> void:
 
 func _on_request_started() -> void:
 	_status_label.text = "Thinking..."
+	_show_thinking_bubble()
 
 
 func _on_response_received(text: String, session_id: String) -> void:
+	_hide_thinking_bubble()
 	_set_ui_busy(false)
 	_status_label.text = "Ready"
 	if session_id != "":
@@ -676,9 +699,134 @@ func _on_response_received(text: String, session_id: String) -> void:
 
 
 func _on_error_occurred(message: String) -> void:
+	_stop_poll_timer()
+	_hide_thinking_bubble()
+	_discard_streaming_bubble()
 	_set_ui_busy(false)
 	_status_label.text = "Error"
 	_add_error_message(message)
+
+
+# ---------------------------------------------------------------------------
+# Thinking indicator
+# ---------------------------------------------------------------------------
+
+func _show_thinking_bubble() -> void:
+	_hide_thinking_bubble()
+
+	_thinking_bubble = PanelContainer.new()
+	_thinking_bubble.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var label := RichTextLabel.new()
+	label.bbcode_enabled = true
+	label.fit_content = true
+	label.scroll_active = false
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	label.name = "ThinkingLabel"
+	label.text = "[color=#a8d5a2][b]Claude[/b][/color]\n[color=#666666]" + _THINKING_FRAMES[0] + "[/color]"
+
+	_thinking_bubble.add_child(label)
+	_chat_vbox.add_child(_thinking_bubble)
+	call_deferred("_do_scroll_to_bottom")
+
+	_thinking_frame = 0
+	_thinking_timer = Timer.new()
+	_thinking_timer.wait_time = 0.4
+	_thinking_timer.autostart = true
+	_thinking_timer.timeout.connect(_on_thinking_tick)
+	add_child(_thinking_timer)
+
+
+func _on_thinking_tick() -> void:
+	if not is_instance_valid(_thinking_bubble):
+		return
+	_thinking_frame = (_thinking_frame + 1) % _THINKING_FRAMES.size()
+	var label := _thinking_bubble.get_node_or_null("ThinkingLabel") as RichTextLabel
+	if is_instance_valid(label):
+		label.text = "[color=#a8d5a2][b]Claude[/b][/color]\n[color=#666666]" + _THINKING_FRAMES[_thinking_frame] + "[/color]"
+
+
+func _hide_thinking_bubble() -> void:
+	if is_instance_valid(_thinking_timer):
+		_thinking_timer.stop()
+		_thinking_timer.queue_free()
+		_thinking_timer = null
+	if is_instance_valid(_thinking_bubble):
+		_thinking_bubble.queue_free()
+		_thinking_bubble = null
+
+
+# ---------------------------------------------------------------------------
+# Streaming
+# ---------------------------------------------------------------------------
+
+func _start_poll_timer() -> void:
+	_stop_poll_timer()
+	_poll_timer = Timer.new()
+	_poll_timer.wait_time = 0.1
+	_poll_timer.autostart = true
+	_poll_timer.timeout.connect(_runner.poll_stream)
+	add_child(_poll_timer)
+
+
+func _stop_poll_timer() -> void:
+	if is_instance_valid(_poll_timer):
+		_poll_timer.stop()
+		_poll_timer.queue_free()
+		_poll_timer = null
+
+
+func _on_stream_chunk(text: String) -> void:
+	# First chunk: swap the thinking bubble for a live response bubble
+	if not is_instance_valid(_streaming_container):
+		_hide_thinking_bubble()
+		_streaming_text = ""
+		_streaming_container = PanelContainer.new()
+		_streaming_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_streaming_label = RichTextLabel.new()
+		_streaming_label.bbcode_enabled = true
+		_streaming_label.fit_content = true
+		_streaming_label.scroll_active = false
+		_streaming_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_streaming_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		_streaming_label.selection_enabled = true
+		_streaming_label.text = "[color=#a8d5a2][b]Claude[/b][/color]\n"
+		_streaming_container.add_child(_streaming_label)
+		_chat_vbox.add_child(_streaming_container)
+
+	_streaming_text += text
+	if is_instance_valid(_streaming_label):
+		_streaming_label.text = (
+			"[color=#a8d5a2][b]Claude[/b][/color]\n" + _markdown_to_bbcode(_streaming_text)
+		)
+	call_deferred("_do_scroll_to_bottom")
+
+
+func _on_stream_finished(session_id: String) -> void:
+	_stop_poll_timer()
+	_set_ui_busy(false)
+	_status_label.text = "Ready"
+	if session_id != "":
+		_session_id = session_id
+		_save_session_state()
+	if not _streaming_text.is_empty():
+		_message_history.append({"type": "claude", "text": _streaming_text})
+		if _message_history.size() > _HISTORY_MAX:
+			_message_history.pop_front()
+		_save_history()
+	_streaming_container = null
+	_streaming_label = null
+	_streaming_text = ""
+
+
+func _discard_streaming_bubble() -> void:
+	## Removes a partial streaming bubble on error (no history entry written).
+	if is_instance_valid(_streaming_container):
+		_streaming_container.queue_free()
+	_streaming_container = null
+	_streaming_label = null
+	_streaming_text = ""
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +974,8 @@ func _clear_chat_ui() -> void:
 	for child in _chat_vbox.get_children():
 		child.queue_free()
 	_install_overlay = null
+	_streaming_container = null  # freed above; null the reference
+	_streaming_label = null
 
 
 func _clear_chat() -> void:
@@ -909,12 +1059,10 @@ func _load_history() -> void:
 func _export_chat_markdown() -> void:
 	if _message_history.is_empty():
 		_status_label.text = "Nothing to export"
-		get_tree().create_timer(2.0).timeout.connect(
-			func():
-				if is_instance_valid(self):
-					_status_label.text = "Ready",
-			CONNECT_ONE_SHOT
-		)
+		var _reset_cb1 := func():
+			if is_instance_valid(self):
+				_status_label.text = "Ready"
+		get_tree().create_timer(2.0).timeout.connect(_reset_cb1, CONNECT_ONE_SHOT)
 		return
 
 	var dt := Time.get_datetime_dict_from_system()
@@ -945,12 +1093,10 @@ func _export_chat_markdown() -> void:
 	f.close()
 
 	_status_label.text = "Exported: res://" + filename
-	get_tree().create_timer(3.0).timeout.connect(
-		func():
-			if is_instance_valid(self):
-				_status_label.text = "Ready",
-		CONNECT_ONE_SHOT
-	)
+	var _reset_cb2 := func():
+		if is_instance_valid(self):
+			_status_label.text = "Ready"
+	get_tree().create_timer(3.0).timeout.connect(_reset_cb2, CONNECT_ONE_SHOT)
 
 
 # ---------------------------------------------------------------------------
@@ -958,7 +1104,7 @@ func _export_chat_markdown() -> void:
 # ---------------------------------------------------------------------------
 
 ## Called by ClaudeContextMenu when "Ask Claude about this" is selected.
-## Pre-fills the input field with a prompt based on the current selection.
+## Called by ClaudeContextMenu — sends the query immediately.
 func prefill_ask_about_selection() -> void:
 	if not is_instance_valid(_input_text) or not is_instance_valid(editor_plugin):
 		return
@@ -972,5 +1118,5 @@ func prefill_ask_about_selection() -> void:
 	else:
 		var names := ", ".join(nodes.map(func(n: Node) -> String: return n.name))
 		_input_text.text = "Tell me about these nodes: %s." % names
-	_input_text.grab_focus()
 	show()
+	_send_message()

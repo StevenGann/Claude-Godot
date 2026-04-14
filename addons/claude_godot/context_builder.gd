@@ -279,7 +279,7 @@ static func _export_vars_context(node: Node) -> String:
 	var_re.compile("\\bvar\\s+(\\w+)")
 
 	for line in script.source_code.split("\n"):
-		var stripped := line.strip_edges()
+		var stripped: String = line.strip_edges()
 		if not stripped.begins_with("@export"):
 			continue
 		var m := var_re.search(stripped)
@@ -355,7 +355,7 @@ static func _signals_context(node: Node) -> String:
 	if script != null and script.resource_path != "":
 		var defined: Array[String] = []
 		for line in script.source_code.split("\n"):
-			var s := line.strip_edges()
+			var s: String = line.strip_edges()
 			if s.begins_with("signal "):
 				defined.append("  " + s)
 		if not defined.is_empty():

@@ -11,6 +11,10 @@ const ContextBuilder = preload("res://addons/claude_godot/context_builder.gd")
 ## Set by plugin.gd before this control is added to the dock.
 var editor_plugin: EditorPlugin
 
+## Emitted after each complete Claude response (streaming or blocking).
+## plugin.gd connects to this to trigger optional Godot Doctor validation.
+signal response_finished
+
 # ---------------------------------------------------------------------------
 # UI node references (populated in _build_ui)
 # ---------------------------------------------------------------------------
@@ -56,6 +60,27 @@ var _thinking_label: RichTextLabel = null
 var _thinking_timer: Timer = null
 var _thinking_frame: int = 0
 const _THINKING_FRAMES: Array = ["●  ○  ○", "○  ●  ○", "○  ○  ●", "○  ●  ○"]
+
+# Status verb rotation
+var _status_verb_timer: Timer = null
+const _STATUS_VERBS: Array = [
+	"Thinking", "Processing", "Pondering", "Percolating", "Fermenting",
+	"Imagining", "Deliberating", "Cogitating", "Synthesizing", "Reticulating Splines",
+	"Extrapolating", "Ruminating", "Conjecturing", "Hallucinating Responsibly",
+	"Consulting the Ether", "Weaving Tokens", "Summoning Insight",
+	"Untangling the Knot", "Staring Into the Void", "Vibing",
+	"Considering the Implications", "Doing Math", "Checking the Vibe",
+	"Consulting Ancient Texts", "Aligning Chakras", "Running the Numbers",
+	"Asking the Universe", "Interpolating Wildly", "Pretending to Know",
+	"Reading the Room", "Manifesting", "Loading Personality",
+	"Questioning Everything", "Herding Tokens", "Connecting the Dots",
+	"Spinning Up the Brain Gears", "Achieving Clarity", "Following a Hunch",
+	"Sifting Through Noise", "Triangulating", "Inverting the Problem",
+	"Touching Grass (Mentally)", "Boiling the Ocean", "Yak Shaving",
+	"Chasing Rabbits", "Untangling Spaghetti", "Defragmenting Soul",
+	"Applying Occam's Razor", "Taking a Wild Guess", "Phoning a Friend",
+	"Consulting the Magic 8-Ball", "Feeding the Hamsters",
+]
 
 # Chat history persistence (4.3)
 var _message_history: Array = []  # Array of {type: String, text: String}
@@ -327,6 +352,27 @@ func _open_settings_dialog() -> void:
 	depth_spin.custom_minimum_size.x = 68
 	depth_spin.value_changed.connect(func(v: float): _save_setting("scene_depth", int(v)))
 	depth_row.add_child(depth_spin)
+
+	c.add_child(HSeparator.new())
+
+	# ── Godot Doctor integration ──────────────────────────────────────────────
+	var gd_header := Label.new()
+	gd_header.text = "Godot Doctor:"
+	gd_header.add_theme_font_size_override("font_size", 13)
+	c.add_child(gd_header)
+
+	var gd_available := ResourceLoader.exists("res://addons/godot_doctor/godot_doctor_plugin.gd")
+	var gd_status := Label.new()
+	gd_status.text = "Status: Installed" if gd_available else "Status: Not installed — install the Godot Doctor plugin to enable."
+	gd_status.add_theme_color_override("font_color",
+		Color(0.45, 0.85, 0.45) if gd_available else Color(0.75, 0.5, 0.3))
+	gd_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	c.add_child(gd_status)
+
+	_make_ctx_toggle(c, "godot_doctor_auto_validate",
+		"Auto-validate after each Claude response", false)
+	_make_ctx_toggle(c, "godot_doctor_auto_send",
+		"Auto-send issues to Claude after validation", false)
 
 	add_child(dialog)
 	dialog.popup_centered()
@@ -688,12 +734,40 @@ func _on_preview_context_pressed() -> void:
 # Runner signal handlers
 # ---------------------------------------------------------------------------
 
+func _pick_status_verb() -> void:
+	if not is_instance_valid(_status_label):
+		return
+	var current: String = _status_label.text.trim_suffix("...")
+	var next: String = current
+	while next == current and _STATUS_VERBS.size() > 1:
+		next = _STATUS_VERBS[randi() % _STATUS_VERBS.size()]
+	_status_label.text = next + "..."
+
+
+func _start_status_verb_timer() -> void:
+	_stop_status_verb_timer()
+	_pick_status_verb()
+	_status_verb_timer = Timer.new()
+	_status_verb_timer.wait_time = 2.0
+	_status_verb_timer.autostart = true
+	_status_verb_timer.timeout.connect(_pick_status_verb)
+	add_child(_status_verb_timer)
+
+
+func _stop_status_verb_timer() -> void:
+	if is_instance_valid(_status_verb_timer):
+		_status_verb_timer.stop()
+		_status_verb_timer.queue_free()
+		_status_verb_timer = null
+
+
 func _on_request_started() -> void:
-	_status_label.text = "Thinking..."
+	_start_status_verb_timer()
 	_show_thinking_bubble()
 
 
 func _on_response_received(text: String, session_id: String) -> void:
+	_stop_status_verb_timer()
 	_hide_thinking_bubble()
 	_set_ui_busy(false)
 	_status_label.text = "Ready"
@@ -701,9 +775,11 @@ func _on_response_received(text: String, session_id: String) -> void:
 		_session_id = session_id
 		_save_session_state()
 	_add_claude_message(text)
+	response_finished.emit()
 
 
 func _on_error_occurred(message: String) -> void:
+	_stop_status_verb_timer()
 	_stop_poll_timer()
 	_hide_thinking_bubble()
 	_discard_streaming_bubble()
@@ -775,6 +851,7 @@ func _hide_thinking_bubble() -> void:
 
 
 func _on_cancel_pressed() -> void:
+	_stop_status_verb_timer()
 	_stop_poll_timer()
 	_runner.abort()
 	_hide_thinking_bubble()
@@ -831,6 +908,7 @@ func _on_stream_chunk(text: String) -> void:
 
 
 func _on_stream_finished(session_id: String) -> void:
+	_stop_status_verb_timer()
 	_stop_poll_timer()
 	_set_ui_busy(false)
 	_status_label.text = "Ready"
@@ -845,6 +923,7 @@ func _on_stream_finished(session_id: String) -> void:
 	_streaming_container = null
 	_streaming_label = null
 	_streaming_text = ""
+	response_finished.emit()
 
 
 func _discard_streaming_bubble() -> void:
@@ -1246,6 +1325,40 @@ func _export_chat_markdown() -> void:
 
 ## Called by ClaudeContextMenu when "Ask Claude about this" is selected.
 ## Called by ClaudeContextMenu — sends the query immediately.
+func fix_errors(errors_text: String) -> void:
+	## Called by plugin.gd when the user clicks "Fix With Claude" in the Errors tab.
+	if not is_instance_valid(_input_text):
+		return
+	var prompt := "I have the following errors in the Godot debugger. Please help me fix them:\n\n%s" % errors_text
+	_input_text.text = prompt
+	show()
+	_send_message()
+
+
+func send_output_log(log_text: String) -> void:
+	## Called by plugin.gd when the user clicks "Send To Claude" in the Output tab.
+	if not is_instance_valid(_input_text):
+		return
+	var prompt := "Here is the output log from my Godot project. Please help me understand any errors or warnings:\n\n%s" % log_text
+	_input_text.text = prompt
+	show()
+	_send_message()
+
+
+func fix_godot_doctor_issues(issues_text: String) -> void:
+	## Called by plugin.gd for the Godot Doctor "Fix with Claude" button
+	## and for the auto-send flow after post-response validation.
+	if not is_instance_valid(_input_text):
+		return
+	var prompt := (
+		"Godot Doctor validation found the following issues in my scene/resources. "
+		+ "Please help me understand and fix them:\n\n%s"
+	) % issues_text
+	_input_text.text = prompt
+	show()
+	_send_message()
+
+
 func prefill_ask_about_selection() -> void:
 	if not is_instance_valid(_input_text) or not is_instance_valid(editor_plugin):
 		return

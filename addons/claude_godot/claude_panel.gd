@@ -39,6 +39,21 @@ var _sudo_check: CheckButton
 
 # Title bar extra buttons
 var _export_btn: Button
+var _init_btn: Button
+var _compact_btn: Button
+
+# Usage visualization
+var _usage_bar: ProgressBar = null
+var _usage_fill_style: StyleBoxFlat = null
+## Per-session running totals. Keys: turns, total_cost_usd,
+## last_turn_input, last_turn_output, last_turn_cost, last_rate_limit (Dict).
+var _session_stats: Dictionary = {
+	"turns": 0, "total_cost_usd": 0.0,
+	"last_turn_input": 0, "last_turn_output": 0, "last_turn_cost": 0.0,
+	"last_rate_limit": {},
+}
+## Last-seen usage snapshot, keyed identically to ClaudeRunner.usage_updated.
+var _last_usage: Dictionary = {}
 
 # ---------------------------------------------------------------------------
 # State
@@ -92,11 +107,27 @@ var _re_inline_code: RegEx
 var _re_bold: RegEx
 var _re_italic: RegEx
 
-# Model list: [display name, model ID]
+# Model list: [display name, model ID].
+# Aliases (opus/sonnet/haiku) auto-track Anthropic's current "latest" selection.
+# Pinned IDs are kept for users who want version stability.
 const _MODELS: Array = [
-	["Sonnet 4.6 (Default)", "claude-sonnet-4-6"],
-	["Opus 4.6 (Most Capable)", "claude-opus-4-6"],
-	["Haiku 4.5 (Fastest)", "claude-haiku-4-5"],
+	["Opus 4.7 (Most Capable)",   "opus"],
+	["Sonnet 4.6 (Default)",      "sonnet"],
+	["Haiku 4.5 (Fastest)",       "haiku"],
+	["Opus 4.6 (pinned)",         "claude-opus-4-6"],
+	["Sonnet 4.6 (pinned)",       "claude-sonnet-4-6"],
+	["Haiku 4.5 (pinned)",        "claude-haiku-4-5"],
+]
+
+# Effort levels for --effort flag.
+# Empty string means "don't pass the flag; use CLI default for the model".
+const _EFFORT_LEVELS: Array = [
+	["Default",    ""],
+	["Low",        "low"],
+	["Medium",     "medium"],
+	["High",       "high"],
+	["Very High",  "xhigh"],
+	["Maximum",    "max"],
 ]
 
 
@@ -118,6 +149,8 @@ func _ready() -> void:
 	_runner.install_finished.connect(_on_install_finished)
 	_runner.stream_chunk.connect(_on_stream_chunk)
 	_runner.stream_finished.connect(_on_stream_finished)
+	_runner.usage_updated.connect(_on_usage_updated)
+	_runner.cli_version_detected.connect(_on_cli_version_detected)
 
 	_build_ui()
 	_load_session_state()
@@ -176,6 +209,18 @@ func _build_title_bar() -> void:
 	_new_chat_button.tooltip_text = "Start a new conversation (clears session and history)"
 	_new_chat_button.pressed.connect(_on_new_chat_pressed)
 	hbox.add_child(_new_chat_button)
+
+	_init_btn = Button.new()
+	_init_btn.text = "Init"
+	_init_btn.tooltip_text = "Run /init to generate or refresh CLAUDE.md for this project"
+	_init_btn.pressed.connect(_on_init_pressed)
+	hbox.add_child(_init_btn)
+
+	_compact_btn = Button.new()
+	_compact_btn.text = "Compact"
+	_compact_btn.tooltip_text = "Run /compact to shrink the running conversation while preserving key context"
+	_compact_btn.pressed.connect(_on_compact_pressed)
+	hbox.add_child(_compact_btn)
 
 	var clear_btn := Button.new()
 	clear_btn.text = "Clear"
@@ -276,7 +321,11 @@ func _open_settings_dialog() -> void:
 	model_row.add_child(model_lbl)
 	var model_opt := OptionButton.new()
 	model_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	var saved_model: String = _get_setting("model", "claude-sonnet-4-6")
+	model_opt.tooltip_text = (
+		"Aliases (opus/sonnet/haiku) auto-track the current latest model.\n" +
+		"Pick a pinned ID to lock to a specific version."
+	)
+	var saved_model: String = _get_setting("model", "sonnet")
 	for i in _MODELS.size():
 		model_opt.add_item(_MODELS[i][0], i)
 		model_opt.set_item_metadata(i, _MODELS[i][1])
@@ -286,6 +335,31 @@ func _open_settings_dialog() -> void:
 		_save_setting("model", model_opt.get_item_metadata(idx))
 	)
 	model_row.add_child(model_opt)
+
+	# ── Effort ───────────────────────────────────────────────────────────────
+	var effort_row := HBoxContainer.new()
+	c.add_child(effort_row)
+	var effort_lbl := Label.new()
+	effort_lbl.text = "Effort:"
+	effort_lbl.custom_minimum_size.x = 60
+	effort_row.add_child(effort_lbl)
+	var effort_opt := OptionButton.new()
+	effort_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	effort_opt.tooltip_text = (
+		"Reasoning budget per turn.\n" +
+		"Higher = more thoroughness, slower, costlier.\n" +
+		"'Default' lets the CLI pick the model's own default."
+	)
+	var saved_effort: String = _get_setting("effort", "")
+	for i in _EFFORT_LEVELS.size():
+		effort_opt.add_item(_EFFORT_LEVELS[i][0], i)
+		effort_opt.set_item_metadata(i, _EFFORT_LEVELS[i][1])
+		if _EFFORT_LEVELS[i][1] == saved_effort:
+			effort_opt.select(i)
+	effort_opt.item_selected.connect(func(idx: int):
+		_save_setting("effort", effort_opt.get_item_metadata(idx))
+	)
+	effort_row.add_child(effort_opt)
 
 	# ── Custom system prompt ──────────────────────────────────────────────────
 	var prompt_lbl := Label.new()
@@ -405,6 +479,24 @@ func _build_chat_area() -> void:
 
 
 func _build_status_bar() -> void:
+	# Thin context-usage bar — subtle, color-ramped.
+	_usage_bar = ProgressBar.new()
+	_usage_bar.min_value = 0.0
+	_usage_bar.max_value = 1.0
+	_usage_bar.value = 0.0
+	_usage_bar.step = 0.0001
+	_usage_bar.show_percentage = false
+	_usage_bar.custom_minimum_size = Vector2(0, 3)
+	_usage_bar.mouse_filter = Control.MOUSE_FILTER_PASS
+	_usage_bar.tooltip_text = "Context usage will appear after the first response."
+	_usage_fill_style = StyleBoxFlat.new()
+	_usage_fill_style.bg_color = Color(0.23, 0.42, 0.23)   # dim green
+	_usage_bar.add_theme_stylebox_override("fill", _usage_fill_style)
+	var bg_style := StyleBoxFlat.new()
+	bg_style.bg_color = Color(0.12, 0.12, 0.12)
+	_usage_bar.add_theme_stylebox_override("background", bg_style)
+	_root_vbox.add_child(_usage_bar)
+
 	_status_label = Label.new()
 	_status_label.text = "Checking for Claude Code..."
 	_status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
@@ -664,12 +756,13 @@ func _send_message() -> void:
 		project_dir = ProjectSettings.globalize_path("res://")
 
 	var model := _get_selected_model()
+	var effort := _get_selected_effort()
 	var allow_files := _file_access_toggle.button_pressed
 	# Try streaming (Linux / macOS). Falls back to blocking send on Windows.
-	if _runner.start_stream(text, context, _session_id, project_dir, allow_files, model):
+	if _runner.start_stream(text, context, _session_id, project_dir, allow_files, model, effort):
 		_start_poll_timer()
 	else:
-		_runner.send(text, context, _session_id, project_dir, allow_files, model)
+		_runner.send(text, context, _session_id, project_dir, allow_files, model, effort)
 
 
 ## Assembles the settings dictionary passed to ContextBuilder.build().
@@ -694,7 +787,11 @@ func _build_settings_dict() -> Dictionary:
 
 
 func _get_selected_model() -> String:
-	return _get_setting("model", "claude-sonnet-4-6")
+	return _get_setting("model", "sonnet")
+
+
+func _get_selected_effort() -> String:
+	return _get_setting("effort", "")
 
 
 # ---------------------------------------------------------------------------
@@ -1172,19 +1269,196 @@ func _set_ui_busy(busy: bool) -> void:
 		_new_chat_button.disabled = busy
 	if is_instance_valid(_export_btn):
 		_export_btn.disabled = busy
+	if is_instance_valid(_init_btn):
+		_init_btn.disabled = busy
+	if is_instance_valid(_compact_btn):
+		_compact_btn.disabled = busy
 
 
 func _on_new_chat_pressed() -> void:
 	_session_id = ""
 	_save_session_state()
 	_clear_chat()
+	_reset_usage_display()
 	_add_system_message("New conversation started.")
 	_status_label.text = "Ready"
+
+
+# ---------------------------------------------------------------------------
+# Usage visualization
+# ---------------------------------------------------------------------------
+
+func _on_cli_version_detected(version: String) -> void:
+	# Expect "2.1.119" or similar — warn once if older than 2.1.
+	var parts := version.split(".")
+	if parts.size() >= 2:
+		var major := int(parts[0])
+		var minor := int(parts[1])
+		if major < 2 or (major == 2 and minor < 1):
+			_add_system_message(
+				"Claude CLI %s detected. Streaming may be degraded — please upgrade (`claude update`) for best results." % version
+			)
+
+
+func _on_usage_updated(usage: Dictionary) -> void:
+	## Merges an incremental usage payload into _last_usage and refreshes the bar.
+	## The bar fills based on input-side tokens against the model's context window.
+	## Rate-limit events come in on their own, without a token payload.
+	if usage.has("rate_limit"):
+		_session_stats["last_rate_limit"] = usage["rate_limit"]
+	for k in usage.keys():
+		_last_usage[k] = usage[k]
+
+	if usage.get("is_final", false):
+		_session_stats["turns"] = int(_session_stats["turns"]) + 1
+		_session_stats["last_turn_input"] = int(usage.get("input_tokens", 0))
+		_session_stats["last_turn_output"] = int(usage.get("output_tokens", 0))
+		var cost: float = float(usage.get("total_cost_usd", 0.0))
+		_session_stats["last_turn_cost"] = cost
+		_session_stats["total_cost_usd"] = float(_session_stats["total_cost_usd"]) + cost
+
+	_refresh_usage_bar()
+
+
+func _refresh_usage_bar() -> void:
+	if not is_instance_valid(_usage_bar):
+		return
+
+	var ctx_window: int = int(_last_usage.get("context_window", 200000))
+	if ctx_window <= 0:
+		ctx_window = 200000  # safe fallback for current-gen models
+	var input_tokens: int = int(_last_usage.get("input_tokens", 0))
+	var cache_read: int = int(_last_usage.get("cache_read_input_tokens", 0))
+	var cache_create: int = int(_last_usage.get("cache_creation_input_tokens", 0))
+	var used: int = input_tokens + cache_read + cache_create
+	var ratio: float = clampf(float(used) / float(ctx_window), 0.0, 1.0)
+
+	_usage_bar.value = ratio
+
+	# Color ramp
+	var color: Color
+	if ratio < 0.50:
+		color = Color(0.23, 0.42, 0.23)      # dim green
+	elif ratio < 0.80:
+		color = Color(0.66, 0.48, 0.23)      # muted amber
+	elif ratio < 0.95:
+		color = Color(0.78, 0.44, 0.14)      # orange
+	else:
+		color = Color(0.69, 0.19, 0.19)      # red
+	if is_instance_valid(_usage_fill_style):
+		_usage_fill_style.bg_color = color
+
+	# Tooltip
+	var pct := ratio * 100.0
+	var output_tokens: int = int(_last_usage.get("output_tokens", 0))
+	var model_name: String = str(_last_usage.get("model", ""))
+	var effort: String = _get_selected_effort()
+	if effort == "":
+		effort = "default"
+	var lines: Array[String] = []
+	lines.append("Context: %s / %s tokens (%.1f%%)" % [
+		_format_tokens(used), _format_tokens(ctx_window), pct
+	])
+	lines.append("  Input this turn: %s" % _format_tokens(input_tokens))
+	lines.append("  Cache read:      %s" % _format_tokens(cache_read))
+	lines.append("  Cache created:   %s" % _format_tokens(cache_create))
+	lines.append("  Output:          %s" % _format_tokens(output_tokens))
+	var last_cost: float = float(_session_stats.get("last_turn_cost", 0.0))
+	if last_cost > 0.0:
+		lines.append("Last turn cost: $%.4f" % last_cost)
+	var total_cost: float = float(_session_stats.get("total_cost_usd", 0.0))
+	var turns: int = int(_session_stats.get("turns", 0))
+	if turns > 0:
+		lines.append("Session total: $%.4f · %d turn%s" % [
+			total_cost, turns, "" if turns == 1 else "s"
+		])
+	var rl = _session_stats.get("last_rate_limit", {})
+	if rl is Dictionary and not rl.is_empty():
+		var status := str(rl.get("status", ""))
+		var kind := str(rl.get("rateLimitType", ""))
+		if status != "" or kind != "":
+			lines.append("Rate limit: %s (%s)" % [status, kind])
+	if model_name != "" or effort != "default":
+		var suffix := ""
+		if model_name != "":
+			suffix += "Model: " + model_name
+		if effort != "default":
+			if suffix != "":
+				suffix += "  ·  "
+			suffix += "Effort: " + effort
+		lines.append(suffix)
+	_usage_bar.tooltip_text = "\n".join(lines)
+
+
+func _format_tokens(n: int) -> String:
+	if n < 1000:
+		return str(n)
+	if n < 1_000_000:
+		return "%s,%03d" % [str(n / 1000), n % 1000]
+	return "%.2fM" % (float(n) / 1_000_000.0)
+
+
+func _reset_usage_display() -> void:
+	_last_usage.clear()
+	_session_stats = {
+		"turns": 0, "total_cost_usd": 0.0,
+		"last_turn_input": 0, "last_turn_output": 0, "last_turn_cost": 0.0,
+		"last_rate_limit": {},
+	}
+	if is_instance_valid(_usage_bar):
+		_usage_bar.value = 0.0
+		_usage_bar.tooltip_text = "Context usage will appear after the first response."
+	if is_instance_valid(_usage_fill_style):
+		_usage_fill_style.bg_color = Color(0.23, 0.42, 0.23)
 
 
 func _on_clear_pressed() -> void:
 	# Clears the display but keeps history so it reloads after restart.
 	_clear_chat_ui()
+
+
+func _on_init_pressed() -> void:
+	## Sends /init as a prompt. /init writes CLAUDE.md and therefore requires
+	## file access — force --add-dir for this one command regardless of the
+	## Files toggle state.
+	if _runner.is_running():
+		return
+	_add_user_message("/init")
+	_add_system_message("Running /init — temporarily allowing file access to write CLAUDE.md.")
+	_set_ui_busy(true)
+	var project_dir := ProjectSettings.globalize_path("res://")
+	var context := ""
+	if _include_context_toggle.button_pressed and is_instance_valid(editor_plugin):
+		context = ContextBuilder.build(editor_plugin, _build_settings_dict())
+	var model := _get_selected_model()
+	var effort := _get_selected_effort()
+	if _runner.start_stream("/init", context, _session_id, project_dir, true, model, effort):
+		_start_poll_timer()
+	else:
+		_runner.send("/init", context, _session_id, project_dir, true, model, effort)
+
+
+func _on_compact_pressed() -> void:
+	## Sends /compact as a prompt. Only meaningful once a session exists.
+	if _runner.is_running():
+		return
+	if _session_id == "":
+		_add_system_message("Nothing to compact yet — start a conversation first.")
+		return
+	_add_user_message("/compact")
+	_add_system_message("Compacting session...")
+	_input_text.text = ""
+	_set_ui_busy(true)
+	var project_dir := ""
+	if _file_access_toggle.button_pressed:
+		project_dir = ProjectSettings.globalize_path("res://")
+	var model := _get_selected_model()
+	var effort := _get_selected_effort()
+	var allow_files := _file_access_toggle.button_pressed
+	if _runner.start_stream("/compact", "", _session_id, project_dir, allow_files, model, effort):
+		_start_poll_timer()
+	else:
+		_runner.send("/compact", "", _session_id, project_dir, allow_files, model, effort)
 
 
 func _clear_chat_ui() -> void:

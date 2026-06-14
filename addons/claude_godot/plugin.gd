@@ -12,6 +12,7 @@ var _errors_tree_ref: Tree = null  # reference to the error Tree widget in the E
 var _send_output_btn: Button = null
 var _output_log_ref: RichTextLabel = null  # reference to the Output tab's log label
 var _gd_bridge: ClaudeGodotDoctorBridge = null
+var _gd_auto_send_in_flight: bool = false
 
 
 func _enter_tree() -> void:
@@ -229,20 +230,7 @@ func _inject_godot_doctor_button() -> void:
 
 
 func _on_panel_response_finished() -> void:
-	if not _read_setting("godot_doctor_auto_validate", false):
-		return
-	if not _gd_bridge.is_installed():
-		return
-	var validated := _gd_bridge.trigger_validation(self)
-	if not validated:
-		return
-	if not _read_setting("godot_doctor_auto_send", false):
-		return
-	var issues := _gd_bridge.collect_issues(self)
-	if issues.is_empty():
-		return
-	if is_instance_valid(_panel):
-		_panel.call("fix_godot_doctor_issues", issues)
+	return
 
 
 ## Reads a Claude Godot plugin setting from EditorSettings project metadata.
